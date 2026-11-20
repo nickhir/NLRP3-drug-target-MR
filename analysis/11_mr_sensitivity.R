@@ -1,0 +1,69 @@
+# sensitivity analyses, r2 sweep and leave-one-out
+
+suppressPackageStartupMessages(library(MendelianRandomization))
+source(here::here("config.R"))
+source(here::here("helpers.R"))
+
+out_dir <- step_dir("11_mr_sensitivity")
+
+cad <- lapply(CAD_STUDIES, read_cad)
+names(cad) <- sapply(CAD_STUDIES, `[[`, "label")
+
+# per-variant meta-analysis of the four studies, per unit lower activity
+cad_meta_for <- function(ex) {
+    ex <- transmute(ex, SNP, pos_hg38, A1, A2, bx = -beta, bxse = se)
+    per_study <- lapply(cad, cad_at, ex = ex)
+    list(meta = meta_snp(bind_rows(per_study)), coverage = sapply(per_study, nrow))
+}
+
+mr_for <- function(meta, label) {
+    mi <- mr_input(bx = meta$bx, bxse = meta$bxse, by = meta$by, byse = meta$byse,
+                   snps = meta$SNP, correlation = interval_ld_matrix(meta$SNP))
+    iv <- mr_ivw(mi)
+    wm <- mr_median(mi, weighting = "weighted")
+    eg <- mr_egger(mi)
+    tibble(label = label, n_snps = nrow(meta),
+           egger_intercept = eg$Intercept, egger_intercept_p = eg$Pvalue.Int,
+           method = c("IVW", "Weighted median"),
+           estimate = c(iv$Estimate, wm$Estimate), se = c(iv$StdError, wm$StdError),
+           ci_lower = c(iv$CILower, wm$CILower), ci_upper = c(iv$CIUpper, wm$CIUpper),
+           p = c(iv$Pvalue, wm$Pvalue),
+           het_q = c(iv$Heter.Stat[1], NA), het_p = c(iv$Heter.Stat[2], NA))
+}
+
+
+# r2 sweep
+sweep <- lapply(c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6), function(r2) {
+    sel <- select_instruments(READOUTS, CHR, INSTRUMENT_START, INSTRUMENT_END, r2)
+    ex <- sel$score %>%
+        mutate(pos_hg38 = as.integer(snp_field(SNP, 2)), A1 = snp_field(SNP, 3),
+               A2 = snp_field(SNP, 4), pc1_var_explained = sel$pc1_var, r2_threshold = r2) %>%
+        arrange(pos_hg38)
+    cm <- cad_meta_for(ex)
+    res <- mr_for(cm$meta, sprintf("r2 < %.1f", r2)) %>%
+        mutate(r2_threshold = r2, pc1_var_explained = sel$pc1_var, n_selected = nrow(ex),
+               n_aragam = cm$coverage[["Aragam et al."]], n_mvp = cm$coverage[["MVP"]],
+               n_finngen = cm$coverage[["FinnGen"]], n_allofus = cm$coverage[["All of Us"]])
+    list(ex = ex, meta = cm$meta, res = res,
+         spec = mutate(sel$specificity, r2_threshold = r2))
+})
+write_tsv(map_dfr(sweep, "res"), file.path(out_dir, "r2_sweep.tsv"))
+write_tsv(map_dfr(sweep, "ex"), file.path(out_dir, "r2_sweep_instruments.tsv"))
+write_tsv(map_dfr(sweep, "spec"), file.path(out_dir, "r2_sweep_specificity.tsv"))
+print(as.data.frame(map_dfr(sweep, "res") %>%
+    filter(method == "IVW") %>%
+    transmute(label, n_snps, OR = exp(estimate), p, egger_intercept_p)), row.names = FALSE, digits = 3)
+
+# r2 < 0.1 gives the main instruments
+ex01 <- sweep[[1]]$ex
+meta01 <- sweep[[1]]$meta
+
+
+# leave-one-out
+loo <- bind_rows(
+    mutate(mr_for(meta01, "All instruments"), dropped = "none"),
+    lapply(ex01$SNP, function(s) {
+        mutate(mr_for(filter(meta01, SNP != s), sprintf("without %s", s)), dropped = s)
+    })
+)
+write_tsv(loo, file.path(out_dir, "leave_one_out.tsv"))

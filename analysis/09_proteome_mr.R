@@ -1,0 +1,62 @@
+# MR on every protein in UKB-PPP
+
+source(here::here("config.R"))
+source(here::here("helpers.R"))
+
+out_dir <- step_dir("09_proteome_mr")
+
+exposure <- load_instruments()
+ld_full <- interval_ld_matrix(exposure$SNP)
+
+assays <- tibble(protein_id = readLines(ppp_manifest)) %>%
+    filter(protein_id != "") %>%
+    mutate(
+        path = file.path(ppp_dir, paste0(protein_id, ".bgz")),
+        gene_name = sub("_.*$", "", protein_id),
+        uniprot = map_chr(str_split(protein_id, "_"), 2, .default = NA_character_),
+        olink_id = map_chr(str_split(protein_id, "_"), 3, .default = NA_character_),
+        panel = sub("^[^_]+_[^_]+_[^_]+_[^_]+_", "", protein_id)
+    )
+
+run_one <- function(i) {
+    a <- assays[i, ]
+    mr <- mr_ppp_assay(a$path, exposure, ld_full)
+    list(
+        res = bind_cols(select(a, protein_id, gene_name, uniprot, olink_id, panel), mr$res),
+        harm = mr$dat %>%
+            select(SNP, A1, A2, beta_exposure, se_exposure, beta_outcome, se_outcome,
+                   eaf_outcome, p_outcome, info, n_outcome) %>%
+            mutate(protein_id = a$protein_id, gene_name = a$gene_name, .before = 1)
+    )
+}
+results_list <- lapply(seq_len(nrow(assays)), run_one)
+mr_all <- map_dfr(results_list, "res")
+harmonised <- map_dfr(results_list, "harm")
+
+# keep the most significant assay per protein, N_EFFECTIVE_TESTS is from 09b
+N_EFFECTIVE_TESTS <- 1821
+mr_dedup <- mr_all %>%
+    group_by(gene_name) %>%
+    slice_min(order_by = ivw_pval, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(ivw_pval) %>%
+    mutate(ivw_pval_bonf = pmin(ivw_pval * N_EFFECTIVE_TESTS, 1))
+
+print(mr_dedup %>%
+          filter(ivw_pval_bonf < 0.05) %>%
+          select(gene_name, n_snps, ivw_beta, ivw_se, ivw_pval, ivw_pval_bonf),
+      n = 50)
+
+run_metadata <- tibble(
+    key = c("exposure_direction", "cohort", "cohort_note", "ld_panel",
+            "n_effective_tests", "ppp_dir", "generated"),
+    value = c(EXPOSURE_DIRECTION, "UKB-PPP Combined (Synapse syn51365308)",
+              "all ancestries, not European-only; ~3-5% non-European", ld_panel,
+              as.character(N_EFFECTIVE_TESTS), ppp_dir, format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+)
+
+write_tsv(mr_all, file.path(out_dir, "ukb_ppp_proteome_mr_all_assays.tsv"))
+write_tsv(mr_dedup, file.path(out_dir, "ukb_ppp_proteome_mr_results.tsv"))
+write_tsv(harmonised, file.path(out_dir, "ukb_ppp_proteome_harmonised.tsv"))
+write_tsv(run_metadata, file.path(out_dir, "ukb_ppp_proteome_run_metadata.tsv"))
+saveRDS(ld_full, file.path(out_dir, "ukb_ppp_proteome_ld_matrix.rds"))
